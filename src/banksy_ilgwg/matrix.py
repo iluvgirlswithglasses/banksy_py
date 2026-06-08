@@ -14,10 +14,16 @@ Neighbour mean (m = 0)::
 
 Azimuthal Gabor filter (m >= 1)::
 
-    AGF_m = | W @ X |               W = g * e^{i m theta}  (complex CSR)
+    AGF_m = sqrt(Re^2 + Im^2)       Re = (g cos m theta) @ X
+                                    Im = (g sin m theta) @ X
 
-This turns the original O(n_obs) Python loop into a single complex sparse
-mat-mul per order.
+This turns the original O(n_obs) Python loop into two real sparse mat-muls per
+order (the algebraic equivalent of ``|sum_j g_j e^{i m theta_j} x_j|``), avoiding
+a complex adjacency and a complex dense product.
+
+Memory: blocks are z-scored and scaled straight into one preallocated output
+buffer, so the dense neighbour matrices, their z-scored copies, and the final
+concatenation are never all held at once.
 
 Note on centering: the original ``create_nbr_matrix`` has a ``center=True``
 default that subtracts the neighbourhood mean before the filter, but the
@@ -96,31 +102,43 @@ def build_banksy_matrix(
     coords = np.asarray(adata.obsm[coord_key], dtype=np.float64)
     x_dense = _as_dense(adata.X)
     n_obs = adata.n_obs
+    n_genes = x_dense.shape[1]
 
     neighborhood = SpatialNeighborhood(coords)
+    num_nbr = max_m + 1  # number of neighbour blocks (order 0 .. max_m)
+    scale_factors = _scale_factors(
+        num_neighbour_matrices=num_nbr, lambda_param=lambda_param
+    )
 
-    # Order 0: weighted neighbour mean. Query k_geom neighbours directly (slicing
-    # a larger query would reshuffle ties on gridded data).
+    # Stream each block straight into a single preallocated output buffer,
+    # z-scoring and scaling in place. This avoids building a list of dense
+    # neighbour matrices, a second list of z-scored copies, and a concatenate
+    # copy on top -- the original held all three simultaneously (~3x the output).
+    out = np.empty((n_obs, (num_nbr + 1) * n_genes), dtype=np.float64)
+
+    def block(index: int) -> np.ndarray:
+        return out[:, index * n_genes : (index + 1) * n_genes]
+
+    # Block 0: the cell's own expression (x_dense is read-only; reused below).
+    _zscore_into(x_dense, scale_factors[0], block(0))
+
+    # Block 1: order-0 weighted neighbour mean. Query k_geom neighbours directly
+    # (slicing a larger query would reshuffle ties on gridded data).
     idx0, dist0, _ = neighborhood.query(k_geom)
     w0 = edge_adjacency(idx0, scaled_gaussian_weights(dist0), n_obs)
-    nbr_matrices: list[np.ndarray] = [np.asarray(w0 @ x_dense)]
+    nbr_mean = np.asarray(w0 @ x_dense)
+    del w0
+    _zscore_into(nbr_mean, scale_factors[1], block(1))
+    del nbr_mean
 
-    # Orders >= 1: azimuthal Gabor filter magnitude (each over k_geom*(m+1) nbrs).
+    # Blocks 2..: azimuthal Gabor filter magnitude (each over k_geom*(m+1) nbrs).
     for m in range(1, max_m + 1):
         idx, dist, deltas = neighborhood.query(k_geom * (m + 1))
-        nbr_matrices.append(_agf_magnitude(idx, dist, deltas, m, x_dense, n_obs))
+        mag = _agf_magnitude(idx, dist, deltas, m, x_dense, n_obs)
+        _zscore_into(mag, scale_factors[m + 1], block(m + 1))
+        del mag
 
-    mat_list = [x_dense, *nbr_matrices]
-    scale_factors = _scale_factors(
-        num_neighbour_matrices=len(nbr_matrices), lambda_param=lambda_param
-    )
-
-    scaled = [scale_factors[n] * _zscore_columns(mat) for n, mat in enumerate(mat_list)]
-    concatenated = np.concatenate(scaled, axis=1)
-
-    return anndata.AnnData(
-        concatenated, obs=adata.obs, var=_build_var(adata, len(nbr_matrices))
-    )
+    return anndata.AnnData(out, obs=adata.obs, var=_build_var(adata, num_nbr))
 
 
 def _agf_magnitude(
@@ -133,14 +151,32 @@ def _agf_magnitude(
 ) -> np.ndarray:
     """Vectorized (un-centered) azimuthal Gabor filter magnitude for order ``m``.
 
-    Equivalent to the original's complex weighting ``|sum_j g_j e^{i m theta_j} x_j|``
-    via a single complex sparse mat-mul.
+    The original applies a single *complex* weighting ``|sum_j g_j e^{i m theta_j} x_j|``,
+    which forces a complex adjacency (16 bytes/nnz) and a complex dense product
+    (2x a real block). We split it into the algebraically identical real form::
+
+        Re = sum_j g_j cos(m theta_j) x_j      Im = sum_j g_j sin(m theta_j) x_j
+        |.| = sqrt(Re^2 + Im^2)
+
+    so each adjacency is real and the two real products are built one at a time.
     """
     g = scaled_gaussian_weights(dist)
-    theta = azimuthal_angles(deltas)
+    m_theta = m * azimuthal_angles(deltas)
 
-    weights = edge_adjacency(idx, g * np.exp(1j * m * theta), n_obs)
-    return np.abs(np.asarray(weights @ x_dense))
+    w_re = edge_adjacency(idx, g * np.cos(m_theta), n_obs)
+    re = np.asarray(w_re @ x_dense)
+    del w_re
+
+    w_im = edge_adjacency(idx, g * np.sin(m_theta), n_obs)
+    im = np.asarray(w_im @ x_dense)
+    del w_im
+
+    # magnitude = sqrt(re**2 + im**2), computed in place to avoid extra buffers.
+    np.square(re, out=re)
+    np.square(im, out=im)
+    re += im
+    np.sqrt(re, out=re)
+    return re
 
 
 def _scale_factors(*, num_neighbour_matrices: int, lambda_param: float) -> np.ndarray:
@@ -158,19 +194,27 @@ def _scale_factors(*, num_neighbour_matrices: int, lambda_param: float) -> np.nd
     return np.sqrt(squared)
 
 
-def _zscore_columns(matrix: np.ndarray) -> np.ndarray:
-    """Feature-wise z-score replicating the original ``main.zscore`` exactly.
+def _zscore_into(matrix: np.ndarray, scale: float, dst: np.ndarray) -> None:
+    """Feature-wise z-score (then scale) written directly into ``dst``.
 
-    Uses population variance via ``E[x^2] - E[x]^2`` (not ``np.std``) and
-    ``nan_to_num`` for zero-variance columns, matching the original byte-for-byte
-    in arithmetic form.
+    Replicates the original ``main.zscore`` arithmetic -- population variance via
+    ``E[x^2] - E[x]^2`` (not ``np.std``) and ``nan_to_num`` for zero-variance
+    columns -- but streams the result into a caller-owned output view and never
+    mutates ``matrix``. ``E[x^2]`` is contracted with ``einsum`` so no full-size
+    squared copy of ``matrix`` is materialized.
     """
     mat = np.asarray(matrix, dtype=np.float64)
+    n_rows = mat.shape[0]
+
     e_x = mat.mean(axis=0)
-    e_x2 = np.square(mat).mean(axis=0)
-    variance = e_x2 - np.square(e_x)
-    zscored = (mat - e_x) / np.sqrt(variance)
-    return np.nan_to_num(zscored)
+    e_x2 = np.einsum("ij,ij->j", mat, mat) / n_rows
+    std = np.sqrt(e_x2 - np.square(e_x))
+
+    np.subtract(mat, e_x, out=dst)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        np.divide(dst, std, out=dst)
+    np.nan_to_num(dst, copy=False)
+    dst *= scale
 
 
 def _build_var(adata: anndata.AnnData, num_k: int) -> pd.DataFrame:
