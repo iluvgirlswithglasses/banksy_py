@@ -198,22 +198,25 @@ def _zscore_into(matrix: np.ndarray, scale: float, dst: np.ndarray) -> None:
     """Feature-wise z-score (then scale) written directly into ``dst``.
 
     Replicates the original ``main.zscore`` arithmetic -- population variance via
-    ``E[x^2] - E[x]^2`` (not ``np.std``) and ``nan_to_num`` for zero-variance
+    ``E[x^2] - E[x]^2`` (not ``np.std``) and zero-output for zero-variance
     columns -- but streams the result into a caller-owned output view and never
     mutates ``matrix``. ``E[x^2]`` is contracted with ``einsum`` so no full-size
     squared copy of ``matrix`` is materialized.
+
+    Zero-variance columns (std == 0) are handled by substituting std = 1 before
+    dividing: after subtracting the mean those columns are already all-zero, so
+    the divide is a no-op and the result is correct without any post-hoc NaN scan.
     """
     mat = np.asarray(matrix, dtype=np.float64)
     n_rows = mat.shape[0]
 
     e_x = mat.mean(axis=0)
     e_x2 = np.einsum("ij,ij->j", mat, mat) / n_rows
-    std = np.sqrt(e_x2 - np.square(e_x))
+    std = np.sqrt(np.maximum(e_x2 - np.square(e_x), 0.0))
+    std[std == 0.0] = 1.0
 
     np.subtract(mat, e_x, out=dst)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        np.divide(dst, std, out=dst)
-    np.nan_to_num(dst, copy=False)
+    np.divide(dst, std, out=dst)
     dst *= scale
 
 
