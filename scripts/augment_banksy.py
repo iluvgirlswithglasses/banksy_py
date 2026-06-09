@@ -134,7 +134,7 @@ def load_hvg_subset(input_path: str, n_top_hvg: int) -> ad.AnnData:
     if "highly_variable" in adata.var:
         hvg_var = adata.var.loc[adata.var["highly_variable"].to_numpy(dtype=bool)]
         if "dispersions_norm" in hvg_var:
-            hvg_var = hvg_var.sort_values("dispersions_norm", ascending=False)
+            hvg_var = hvg_var.sort_values("dispersions_norm", ascending=False, kind="stable")
         selected_genes = hvg_var.index[:n_top_hvg]
         adata = adata[:, selected_genes].copy()
     else:
