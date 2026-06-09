@@ -27,7 +27,7 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-banksy")
 import anndata as ad
 import numpy as np
 
-from banksy_ilgwg import build_banksy_matrix
+from banksy_ilgwg import build_banksy_matrix, build_banksy_matrix_raw
 
 COORD_KEYS = ("x", "y", "spatial")
 NBR_WEIGHT_DECAY = "scaled_gaussian"
@@ -68,6 +68,13 @@ def parse_args() -> argparse.Namespace:
         help="gzip compression level for the BANKSY matrix .h5ad backup.",
     )
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument(
+        "--norm",
+        action="store_true",
+        default=False,
+        help="Z-score normalise each block (uses build_banksy_matrix). "
+        "Default: skip normalisation and keep sparse output (build_banksy_matrix_raw).",
+    )
     return parser.parse_args()
 
 
@@ -149,16 +156,17 @@ def main() -> None:
     adata = load_hvg_subset(args.input, args.n_top_hvg)
 
     print(f"Running BANKSY on {adata.n_obs} cells x {adata.n_vars} genes", flush=True)
+    builder = build_banksy_matrix if args.norm else build_banksy_matrix_raw
     print(
         "Parameters: "
         f"k_geom={args.k_geom}, max_m={args.max_m}, "
         f"lambda={args.lambda_param}, pca_dims={args.pca_dims}, "
-        f"seed={args.seed}, backend=banksy_ilgwg",
+        f"seed={args.seed}, backend=banksy_ilgwg, norm={args.norm}",
         flush=True,
     )
 
     timer_start = time.perf_counter()
-    banksy_matrix = build_banksy_matrix(
+    banksy_matrix = builder(
         adata,
         COORD_KEYS,
         k_geom=args.k_geom,
@@ -169,7 +177,7 @@ def main() -> None:
     augmentation_elapsed_seconds = time.perf_counter() - timer_start
     print(
         "BANKSY augmentation runtime "
-        f"(build_banksy_matrix): "
+        f"({builder.__name__}): "
         f"{augmentation_elapsed_seconds:.2f} seconds "
         f"({augmentation_elapsed_seconds / 60:.2f} minutes)",
         flush=True,
@@ -195,6 +203,7 @@ def main() -> None:
             "n_top_hvg": int(args.n_top_hvg),
             "nbr_weight_decay": NBR_WEIGHT_DECAY,
             "seed": int(args.seed),
+            "norm": args.norm,
             "augmentation_elapsed_seconds": round(augmentation_elapsed_seconds, 6),
         },
     )

@@ -20,18 +20,6 @@ Azimuthal Gabor filter (m >= 1)::
 This turns the original O(n_obs) Python loop into two real sparse mat-muls per
 order (the algebraic equivalent of ``|sum_j g_j e^{i m theta_j} x_j|``), avoiding
 a complex adjacency and a complex dense product.
-
-Memory: blocks are z-scored and scaled straight into one preallocated output
-buffer, so the dense neighbour matrices, their z-scored copies, and the final
-concatenation are never all held at once.
-
-Note on centering: the original ``create_nbr_matrix`` has a ``center=True``
-default that subtracts the neighbourhood mean before the filter, but the
-production entry point ``generate_banksy_matrix`` calls it positionally as
-``create_nbr_matrix(adata, banksy_dict, nbr_weight_decay, max_m, variance_balance)``
--- so ``variance_balance`` (``False``) lands in the ``center`` slot and the
-filter actually runs *un-centered*. This backend reproduces that production
-behaviour (no centering).
 """
 
 from __future__ import annotations
@@ -138,6 +126,103 @@ def build_banksy_matrix(
         _zscore_into(mag, scale_factors[m + 1], block(m + 1))
         del mag
 
+    return anndata.AnnData(out, obs=adata.obs, var=_build_var(adata, num_nbr))
+
+
+def build_banksy_matrix_raw(
+    adata: anndata.AnnData,
+    coord_keys: tuple[str, ...] = DEFAULT_COORD_KEYS,
+    *,
+    k_geom: int = 15,
+    max_m: int = 1,
+    lambda_param: float = 0.2,
+    nbr_weight_decay: str = "scaled_gaussian",
+) -> anndata.AnnData:
+    """Build the BANKSY neighbour-augmented matrix without z-score normalization.
+
+    Identical to :func:`build_banksy_matrix` except:
+
+    * z-score normalization is **skipped** -- raw (or pre-normalized) values are
+      used directly.
+    * ``adata.X`` is kept as a sparse matrix throughout; ``AnnData.X`` in the
+      returned object is a scipy CSR matrix.
+
+    The ``lambda_param`` scale factors are still applied so that the relative
+    weighting of own vs. neighbour expression matches the BANKSY formulation.
+    Typical scRNA-seq count/log-norm matrices are >90 % zero; spatial
+    aggregation fills in some entries, but the result is still substantially
+    sparse and much smaller in memory than the z-scored dense variant.
+
+    Parameters
+    ----------
+    adata, coord_keys, k_geom, max_m, lambda_param, nbr_weight_decay:
+        Same semantics as :func:`build_banksy_matrix`.
+
+    Returns
+    -------
+    AnnData
+        Shape ``(n_obs, (max_m + 2) * n_genes)`` **sparse** (CSR) matrix with
+        the original ``obs`` and a ``var`` carrying ``is_nbr`` / ``k``
+        annotations and ``_nbr_{k}`` suffixes.
+    """
+    if nbr_weight_decay != "scaled_gaussian":
+        raise NotImplementedError(
+            f"banksy_ilgwg supports only 'scaled_gaussian', got {nbr_weight_decay!r}"
+        )
+    if not 0.0 <= lambda_param <= 1.0:
+        raise ValueError("lambda_param must be in [0, 1]")
+    if max_m < 0:
+        raise ValueError("max_m must be non-negative")
+
+    coord_key = coord_keys[-1]
+    if coord_key not in adata.obsm:
+        raise KeyError(f"coord key {coord_key!r} not found in adata.obsm")
+
+    coords = np.asarray(adata.obsm[coord_key], dtype=np.float64)
+    x = sparse.csr_matrix(adata.X, dtype=np.float64)
+    n_obs = adata.n_obs
+
+    neighborhood = SpatialNeighborhood(coords)
+    num_nbr = max_m + 1
+    scale_factors = _scale_factors(
+        num_neighbour_matrices=num_nbr, lambda_param=lambda_param
+    )
+
+    blocks: list[sparse.csr_matrix] = [x * scale_factors[0]]
+
+    # Order-0 weighted neighbour mean.
+    idx0, dist0, _ = neighborhood.query(k_geom)
+    w0 = edge_adjacency(idx0, scaled_gaussian_weights(dist0), n_obs)
+    nbr_mean = w0 @ x
+    del w0
+    blocks.append(nbr_mean * scale_factors[1])
+    del nbr_mean
+
+    # Azimuthal Gabor filter magnitude for orders 1..max_m.
+    for m in range(1, max_m + 1):
+        idx, dist, deltas = neighborhood.query(k_geom * (m + 1))
+        g = scaled_gaussian_weights(dist)
+        m_theta = m * azimuthal_angles(deltas)
+
+        w_re = edge_adjacency(idx, g * np.cos(m_theta), n_obs)
+        re = w_re @ x
+        del w_re
+
+        w_im = edge_adjacency(idx, g * np.sin(m_theta), n_obs)
+        im = w_im @ x
+        del w_im
+
+        # sqrt(re^2 + im^2) on sparse matrices: square both, add (union sparsity),
+        # then take sqrt of stored values only.  eliminate_zeros() drops any
+        # entries that cancelled to exactly 0.0 during the addition.
+        mag = re.power(2) + im.power(2)
+        del re, im
+        mag.data = np.sqrt(mag.data)
+        mag.eliminate_zeros()
+        blocks.append(mag * scale_factors[m + 1])
+        del mag
+
+    out = sparse.hstack(blocks, format="csr")
     return anndata.AnnData(out, obs=adata.obs, var=_build_var(adata, num_nbr))
 
 

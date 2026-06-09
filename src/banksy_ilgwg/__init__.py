@@ -6,6 +6,6 @@ package's API.
 
 from __future__ import annotations
 
-from banksy_ilgwg.matrix import build_banksy_matrix
+from banksy_ilgwg.matrix import build_banksy_matrix, build_banksy_matrix_raw
 
-__all__ = ["build_banksy_matrix"]
+__all__ = ["build_banksy_matrix", "build_banksy_matrix_raw"]
