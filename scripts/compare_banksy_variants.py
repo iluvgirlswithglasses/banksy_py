@@ -2,9 +2,13 @@
 """Compare BANKSY variants (z-scored, var-eq dense, var-eq sparse, raw)
 with ground-truth annotations shown side-by-side, plus performance metrics.
 
-Produces two figures:
+Run using: python scripts/compare_banksy_variants.py --lambda-param 0.8 --resolution 0.5 --add-umap
+or customize on your own
+
+Produces up to three figures:
   1) Spatial cluster comparison (5-panel)
-  2) Performance metrics: build time, PCA+Leiden time, matrix memory
+  2) UMAP cluster comparison (4-panel, only with --add-umap)
+  3) Performance metrics: build time, PCA+Leiden time, matrix memory
 
 Also computes ARI (Adjusted Rand Index) for each variant against ground truth.
 """
@@ -15,7 +19,7 @@ import argparse
 import os
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-banksy")
@@ -30,7 +34,6 @@ import numpy as np
 import pandas as pd
 from matplotlib.colors import ListedColormap
 from scipy.sparse import issparse
-from sklearn.decomposition import PCA
 from sklearn.metrics.cluster import adjusted_rand_score
 
 import leidenalg
@@ -43,13 +46,8 @@ from banksy_ilgwg.matrix import (
 )
 from banksy.main import LeidenPartition
 from banksy_utils.color_lists import zeileis_28
-
-VARIANT_NAMES = [
-    "z-scored\n(dense)",
-    "var-eq\n(dense)",
-    "var-eq\n(sparse)",
-    "raw\n(sparse)",
-]
+from banksy_utils.plotting import plot_2d_embeddings
+from banksy_utils.umap_pca_2 import pca_umap_adata
 
 VARIANT_COLORS = ["#4c72b0", "#55a868", "#c44e52", "#8172b2"]
 
@@ -63,7 +61,7 @@ class VariantResult:
     modularity: float = 0.0
     ari: float | None = None
     build_sec: float = 0.0
-    leiden_sec: float = 0.0
+    pca_leiden_sec: float = 0.0
     matrix_mb: float = 0.0
 
 
@@ -97,6 +95,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-m", type=int, default=1)
     p.add_argument("--num-nn", type=int, default=50)
     p.add_argument("--seed", type=int, default=1234)
+    p.add_argument(
+        "--add-umap",
+        action="store_true",
+        default=False,
+        help="Also compute UMAP embeddings and produce a UMAP comparison plot.",
+    )
     return p.parse_args()
 
 
@@ -130,21 +134,30 @@ def matrix_memory_mb(adata_obj: ad.AnnData) -> float:
     return X.nbytes / 1e6
 
 
+def _pca_key(pca_dims: int, param_str: str = "") -> str:
+    return f"reduced_pc_{pca_dims} {param_str}"
+
+
+def _umap_key(pca_dims: int, param_str: str = "") -> str:
+    return f"reduced_pc_{pca_dims}_umap {param_str}"
+
+
 def run_pca_leiden(
     banksy_adata: ad.AnnData,
     pca_dims: int,
     resolution: float,
     num_nn: int,
     seed: int,
+    add_umap: bool = False,
 ) -> tuple:
-    X = banksy_adata.X
-    if issparse(X):
-        X = X.toarray()
-    X = np.asarray(X, dtype=np.float64)
-    X = np.nan_to_num(X, nan=0.0)
+    pca_umap_adata(
+        banksy_adata,
+        pca_dims=[pca_dims],
+        plt_remaining_var=False,
+        add_umap=add_umap,
+    )
 
-    pca = PCA(n_components=pca_dims)
-    reduced = pca.fit_transform(X)
+    reduced = np.asarray(banksy_adata.obsm[_pca_key(pca_dims)])
 
     partitioner = LeidenPartition(
         reduced,
@@ -279,6 +292,55 @@ def plot_spatial(
     print(f"Saved spatial plot: {output_path}")
 
 
+def plot_umap(
+    results: list[VariantResult],
+    pca_dims: int,
+    output_path: Path,
+    lambda_param: float,
+    resolution: float,
+) -> None:
+    n_panels = len(results)
+    fig, axes = plt.subplots(1, n_panels, figsize=(7 * n_panels, 7))
+    if n_panels == 1:
+        axes = [axes]
+
+    for ax, r in zip(axes, results):
+        umap_key = _umap_key(pca_dims)
+        if umap_key not in r.adata.obsm:
+            ax.text(
+                0.5,
+                0.5,
+                "UMAP not computed",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+            ax.set_title(r.name, fontsize=11)
+            continue
+
+        embedding = np.asarray(r.adata.obsm[umap_key])
+        plot_2d_embeddings(
+            embedding,
+            r.labels,
+            method_str="UMAP",
+            space_str=f"({r.name})",
+            ax=ax,
+            plot_cmap=True,
+            cmap_name="Spectral",
+        )
+
+    fig.suptitle(
+        f"BANKSY UMAP Comparison\n"
+        f"lambda={lambda_param}, resolution={resolution}",
+        fontsize=14,
+        fontweight="bold",
+    )
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved UMAP plot: {output_path}")
+
+
 def plot_metrics(
     results: list[VariantResult],
     output_path: Path,
@@ -287,7 +349,7 @@ def plot_metrics(
 ) -> None:
     names = [r.name.replace("\n", " ") for r in results]
     build_times = [r.build_sec for r in results]
-    leiden_times = [r.leiden_sec for r in results]
+    leiden_times = [r.pca_leiden_sec for r in results]
     memories = [r.matrix_mb for r in results]
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
@@ -417,13 +479,18 @@ def main() -> None:
         print(f"\n=== [{i + total}/{total*2}] PCA + Leiden ({name}) ===")
         t0 = time.perf_counter()
         res.labels, res.n_clusters, res.modularity = run_pca_leiden(
-            res.adata, args.pca_dims, args.resolution, args.num_nn, args.seed
+            res.adata,
+            args.pca_dims,
+            args.resolution,
+            args.num_nn,
+            args.seed,
+            add_umap=args.add_umap,
         )
-        res.leiden_sec = time.perf_counter() - t0
+        res.pca_leiden_sec = time.perf_counter() - t0
         print(
             f"  -> {res.n_clusters} clusters, "
             f"modularity={res.modularity:.4f}, "
-            f"time: {res.leiden_sec:.1f}s"
+            f"time: {res.pca_leiden_sec:.1f}s"
         )
 
         results.append(res)
@@ -445,6 +512,16 @@ def main() -> None:
         args.resolution,
         args.ground_truth_key,
     )
+
+    if args.add_umap:
+        print("\n=== Plotting UMAP comparison ===")
+        plot_umap(
+            results,
+            args.pca_dims,
+            output_dir / "banksy_umap_comparison.png",
+            args.lambda_param,
+            args.resolution,
+        )
 
     print("\n=== Plotting performance metrics ===")
     plot_metrics(
@@ -477,7 +554,7 @@ def main() -> None:
                 "modularity": r.modularity,
                 "ari": r.ari,
                 "build_sec": round(r.build_sec, 2),
-                "leiden_sec": round(r.leiden_sec, 2),
+                "pca_leiden_sec": round(r.pca_leiden_sec, 2),
                 "matrix_mb": round(r.matrix_mb, 2),
             }
         )
@@ -493,7 +570,7 @@ def main() -> None:
         print(
             f"  {r.name:25s}: {r.n_clusters} clusters, "
             f"mod={r.modularity:.4f}{ari_str}, "
-            f"build={r.build_sec:.1f}s, leiden={r.leiden_sec:.1f}s, "
+            f"build={r.build_sec:.1f}s, pca+leiden={r.pca_leiden_sec:.1f}s, "
             f"mem={r.matrix_mb:.1f}MB"
         )
 
