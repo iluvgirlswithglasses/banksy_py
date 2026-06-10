@@ -226,6 +226,169 @@ def build_banksy_matrix_raw(
     return anndata.AnnData(out, obs=adata.obs, var=_build_var(adata, num_nbr))
 
 
+def build_banksy_matrix_vareq_dense(
+    adata: anndata.AnnData,
+    coord_keys: tuple[str, ...] = DEFAULT_COORD_KEYS,
+    *,
+    k_geom: int = 15,
+    max_m: int = 1,
+    lambda_param: float = 0.2,
+    nbr_weight_decay: str = "scaled_gaussian",
+) -> anndata.AnnData:
+    """Build the BANKSY neighbour-augmented matrix with variance equalization (dense).
+
+    Identical to :func:`build_banksy_matrix` except each block is
+    variance-equalized (divided by per-feature std, preserving the mean)
+    instead of z-scored (mean-subtracted then divided by std).
+
+    Parameters
+    ----------
+    adata, coord_keys, k_geom, max_m, lambda_param, nbr_weight_decay:
+        Same semantics as :func:`build_banksy_matrix`.
+
+    Returns
+    -------
+    AnnData
+        Shape ``(n_obs, (max_m + 2) * n_genes)`` dense matrix with the original
+        ``obs`` and a ``var`` carrying ``is_nbr`` / ``k`` annotations and
+        ``_nbr_{k}`` suffixes.
+    """
+    if nbr_weight_decay != "scaled_gaussian":
+        raise NotImplementedError(
+            f"banksy_ilgwg supports only 'scaled_gaussian', got {nbr_weight_decay!r}"
+        )
+    if not 0.0 <= lambda_param <= 1.0:
+        raise ValueError("lambda_param must be in [0, 1]")
+    if max_m < 0:
+        raise ValueError("max_m must be non-negative")
+
+    coord_key = coord_keys[-1]
+    if coord_key not in adata.obsm:
+        raise KeyError(f"coord key {coord_key!r} not found in adata.obsm")
+
+    coords = np.asarray(adata.obsm[coord_key], dtype=np.float64)
+    x_dense = _as_dense(adata.X)
+    n_obs = adata.n_obs
+    n_genes = x_dense.shape[1]
+
+    neighborhood = SpatialNeighborhood(coords)
+    num_nbr = max_m + 1
+    scale_factors = _scale_factors(
+        num_neighbour_matrices=num_nbr, lambda_param=lambda_param
+    )
+
+    out = np.empty((n_obs, (num_nbr + 1) * n_genes), dtype=np.float64)
+
+    def block(index: int) -> np.ndarray:
+        return out[:, index * n_genes : (index + 1) * n_genes]
+
+    _var_equalize_into(x_dense, scale_factors[0], block(0))
+
+    idx0, dist0, _ = neighborhood.query(k_geom)
+    w0 = edge_adjacency(idx0, scaled_gaussian_weights(dist0), n_obs)
+    nbr_mean = np.asarray(w0 @ x_dense)
+    del w0
+    _var_equalize_into(nbr_mean, scale_factors[1], block(1))
+    del nbr_mean
+
+    for m in range(1, max_m + 1):
+        idx, dist, deltas = neighborhood.query(k_geom * (m + 1))
+        mag = _agf_magnitude(idx, dist, deltas, m, x_dense, n_obs)
+        _var_equalize_into(mag, scale_factors[m + 1], block(m + 1))
+        del mag
+
+    return anndata.AnnData(out, obs=adata.obs, var=_build_var(adata, num_nbr))
+
+
+def build_banksy_matrix_vareq_sparse(
+    adata: anndata.AnnData,
+    coord_keys: tuple[str, ...] = DEFAULT_COORD_KEYS,
+    *,
+    k_geom: int = 15,
+    max_m: int = 1,
+    lambda_param: float = 0.2,
+    nbr_weight_decay: str = "scaled_gaussian",
+) -> anndata.AnnData:
+    """Build the BANKSY neighbour-augmented matrix with variance equalization (sparse).
+
+    Identical to :func:`build_banksy_matrix_vareq_dense` except all blocks
+    are kept as sparse CSR matrices throughout, reducing memory usage
+    significantly for count/log-norm data that is >90 % zero.
+
+    Variance equalization on a sparse matrix divides each stored value by
+    its column's population std.  This does **not** introduce new non-zero
+    entries (0 / std = 0), so sparsity is fully preserved.
+
+    Parameters
+    ----------
+    adata, coord_keys, k_geom, max_m, lambda_param, nbr_weight_decay:
+        Same semantics as :func:`build_banksy_matrix`.
+
+    Returns
+    -------
+    AnnData
+        Shape ``(n_obs, (max_m + 2) * n_genes)`` **sparse** (CSR) matrix with
+        the original ``obs`` and a ``var`` carrying ``is_nbr`` / ``k``
+        annotations and ``_nbr_{k}`` suffixes.
+    """
+    if nbr_weight_decay != "scaled_gaussian":
+        raise NotImplementedError(
+            f"banksy_ilgwg supports only 'scaled_gaussian', got {nbr_weight_decay!r}"
+        )
+    if not 0.0 <= lambda_param <= 1.0:
+        raise ValueError("lambda_param must be in [0, 1]")
+    if max_m < 0:
+        raise ValueError("max_m must be non-negative")
+
+    coord_key = coord_keys[-1]
+    if coord_key not in adata.obsm:
+        raise KeyError(f"coord key {coord_key!r} not found in adata.obsm")
+
+    coords = np.asarray(adata.obsm[coord_key], dtype=np.float64)
+    x = sparse.csr_matrix(adata.X, dtype=np.float64)
+    n_obs = adata.n_obs
+
+    neighborhood = SpatialNeighborhood(coords)
+    num_nbr = max_m + 1
+    scale_factors = _scale_factors(
+        num_neighbour_matrices=num_nbr, lambda_param=lambda_param
+    )
+
+    blocks: list[sparse.csr_matrix] = [
+        _var_equalize_sparse(x) * scale_factors[0]
+    ]
+
+    idx0, dist0, _ = neighborhood.query(k_geom)
+    w0 = edge_adjacency(idx0, scaled_gaussian_weights(dist0), n_obs)
+    nbr_mean = w0 @ x
+    del w0
+    blocks.append(_var_equalize_sparse(nbr_mean) * scale_factors[1])
+    del nbr_mean
+
+    for m in range(1, max_m + 1):
+        idx, dist, deltas = neighborhood.query(k_geom * (m + 1))
+        g = scaled_gaussian_weights(dist)
+        m_theta = m * azimuthal_angles(deltas)
+
+        w_re = edge_adjacency(idx, g * np.cos(m_theta), n_obs)
+        re = w_re @ x
+        del w_re
+
+        w_im = edge_adjacency(idx, g * np.sin(m_theta), n_obs)
+        im = w_im @ x
+        del w_im
+
+        mag = re.power(2) + im.power(2)
+        del re, im
+        mag.data = np.sqrt(mag.data)
+        mag.eliminate_zeros()
+        blocks.append(_var_equalize_sparse(mag) * scale_factors[m + 1])
+        del mag
+
+    out = sparse.hstack(blocks, format="csr")
+    return anndata.AnnData(out, obs=adata.obs, var=_build_var(adata, num_nbr))
+
+
 def _agf_magnitude(
     idx: np.ndarray,
     dist: np.ndarray,
@@ -303,6 +466,52 @@ def _zscore_into(matrix: np.ndarray, scale: float, dst: np.ndarray) -> None:
     np.subtract(mat, e_x, out=dst)
     np.divide(dst, std, out=dst)
     dst *= scale
+
+
+def _var_equalize_into(matrix: np.ndarray, scale: float, dst: np.ndarray) -> None:
+    """Feature-wise variance equalization (then scale) written into ``dst``.
+
+    Identical to :func:`_zscore_into` except the mean is **not** subtracted.
+    Each feature is divided by its population standard deviation so that all
+    features share the same variance (``scale**2``), while their original
+    means are preserved.
+
+    Zero-variance columns (std == 0) are handled by substituting std = 1
+    (those columns are constant, so dividing by 1 is a no-op).
+    """
+    mat = np.asarray(matrix, dtype=np.float64)
+    n_rows = mat.shape[0]
+
+    e_x = mat.mean(axis=0)
+    e_x2 = np.einsum("ij,ij->j", mat, mat) / n_rows
+    std = np.sqrt(np.maximum(e_x2 - np.square(e_x), 0.0))
+    std[std == 0.0] = 1.0
+
+    np.divide(mat, std, out=dst)
+    dst *= scale
+
+
+def _var_equalize_sparse(mat: sparse.csr_matrix) -> sparse.csr_matrix:
+    """Feature-wise variance equalization on a sparse CSR matrix.
+
+    Returns a **new** CSR matrix (the input is not mutated).  Each stored
+    value is divided by its column's population std so that all features
+    share the same variance while preserving their original means and
+    sparsity pattern.
+
+    Zero-variance columns (std == 0) are handled by substituting std = 1
+    (those columns are constant, so dividing by 1 is a no-op).
+    """
+    n_rows = mat.shape[0]
+    col_means = np.asarray(mat.mean(axis=0)).ravel()
+    col_sq_means = np.asarray(mat.power(2).mean(axis=0)).ravel()
+    col_std = np.sqrt(np.maximum(col_sq_means - np.square(col_means), 0.0))
+    col_std[col_std == 0.0] = 1.0
+
+    result = mat.copy()
+    inv_std = 1.0 / col_std
+    result.data *= inv_std[result.indices]
+    return result
 
 
 def _build_var(adata: anndata.AnnData, num_k: int) -> pd.DataFrame:
